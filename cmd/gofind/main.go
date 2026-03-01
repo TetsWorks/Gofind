@@ -24,7 +24,7 @@ var (
 	flagIndex   = flag.String("index", "", "Indexa um diretório")
 	flagSearch  = flag.String("search", "", "Busca uma query (sem TUI)")
 	flagFuzzy   = flag.Bool("fuzzy", false, "Ativa busca fuzzy")
-	flagWatch   = flag.Bool("watch", false, "Ativa watch mode (re-indexa ao salvar)")
+	flagWatch   = flag.Bool("watch", false, "Ativa watch mode")
 	flagExport  = flag.Bool("json", false, "Exporta resultado em JSON")
 	flagMax     = flag.Int("n", 20, "Número máximo de resultados")
 	flagData    = flag.String("data", defaultDataDir(), "Diretório de dados do índice")
@@ -42,7 +42,6 @@ func main() {
 		return
 	}
 
-	// Inicializa índice e storage
 	store, err := storage.New(*flagData)
 	if err != nil {
 		fatalf("erro ao criar storage: %v", err)
@@ -51,14 +50,11 @@ func main() {
 	idx := indexer.New()
 	idxr := indexer.NewIndexer(idx, 8)
 
-	// Carrega índice existente do disco
 	if store.Exists() {
 		if err := store.Load(idx); err != nil {
 			fmt.Fprintf(os.Stderr, "aviso: erro ao carregar índice: %v\n", err)
 		}
 	}
-
-	// ── Comandos ─────────────────────────────────────────────────────────────
 
 	if *flagClear {
 		store.Clear()
@@ -76,15 +72,12 @@ func main() {
 		return
 	}
 
-	// Se há args sem flags, trata como diretório (index) ou query (search)
 	if args := flag.Args(); len(args) > 0 {
-		// Se parece path, indexa; se não, busca
 		arg := args[0]
 		if info, err := os.Stat(arg); err == nil && info.IsDir() {
 			indexDir(idx, idxr, store, arg)
 			return
 		}
-		// Trata como query de busca sem TUI
 		*flagSearch = strings.Join(args, " ")
 	}
 
@@ -93,10 +86,9 @@ func main() {
 		return
 	}
 
-	// ── TUI interativa ────────────────────────────────────────────────────────
 	if idx.DocCount() == 0 {
 		fmt.Println("Índice vazio. Use: gofind <diretório>")
-		fmt.Println("                   gofind -index <diretório>")
+		fmt.Println("Exemplo:           gofind ~")
 		os.Exit(1)
 	}
 
@@ -127,26 +119,47 @@ func indexDir(idx *indexer.Index, idxr *indexer.Indexer, store *storage.Store, d
 	fmt.Printf("⚡ Indexando [%s]...\n", dir)
 	start := time.Now()
 
-	// Progresso com TUI
+	// Indexa em goroutine
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		if err := idxr.IndexDir(dir); err != nil {
 			fmt.Fprintf(os.Stderr, "erro: %v\n", err)
 		}
 	}()
 
-	tui.ShowProgress(idxr.Progress(), dir)
+	// Consome progresso no terminal (sem tview)
+	for p := range idxr.Progress() {
+		if p.Total > 0 {
+			pct := p.Done * 100 / p.Total
+			filled := pct / 5
+			bar := strings.Repeat("█", filled) + strings.Repeat("░", 20-filled)
+			name := p.Current
+			if len(name) > 28 {
+				name = name[:25] + "..."
+			}
+			fmt.Printf("\r  [%s] %3d%%  %d/%d  %-28s",
+				bar, pct, p.Done, p.Total, name)
+		}
+		if p.Finish {
+			break
+		}
+	}
+	<-done
 
 	elapsed := time.Since(start)
 	stats := idx.Stats()
-	fmt.Printf("\n✓ %d arquivos indexados em %s\n", stats.TotalDocs, elapsed.Round(time.Millisecond))
+	fmt.Printf("\r\033[K") // limpa linha
+	fmt.Printf("✓ %d arquivos indexados em %s\n", stats.TotalDocs, elapsed.Round(time.Millisecond))
 	fmt.Printf("  Tokens: %d  |  Tamanho total: %s\n", stats.TotalTokens, formatSize(stats.TotalSize))
 
-	// Salva em disco
+	fmt.Printf("  Salvando índice...")
 	if err := store.Save(idx); err != nil {
-		fmt.Fprintf(os.Stderr, "aviso: erro ao salvar índice: %v\n", err)
+		fmt.Fprintf(os.Stderr, "\naviso: erro ao salvar: %v\n", err)
 	} else {
-		fmt.Printf("  Índice salvo em: %s\n", *flagData)
+		fmt.Printf(" ✓\n")
 	}
+	fmt.Println("  Pronto! Use 'gofind' para buscar.")
 }
 
 func searchCLI(idx *indexer.Index, query string) {
@@ -188,15 +201,12 @@ func searchCLI(idx *indexer.Index, query string) {
 		return
 	}
 
-	// Output tabular
 	fmt.Printf("\n[%d resultados em %s]\n\n", len(results), elapsed.Round(time.Microsecond))
-	fmt.Printf("%-6s %-8s %-8s %s\n", "SCORE", "TIPO", "PALAVRAS", "PATH")
+	fmt.Printf("%-8s %-8s %-8s %s\n", "SCORE", "TIPO", "PALAVRAS", "PATH")
 	fmt.Println(strings.Repeat("─", 80))
-
 	for _, r := range results {
-		score := fmt.Sprintf("%.4f", r.Score)
-		fmt.Printf("%-6s %-8s %-8d %s\n",
-			score, r.Doc.Type, r.Doc.WordCount, r.Doc.Path)
+		fmt.Printf("%-8.4f %-8s %-8d %s\n",
+			r.Score, r.Doc.Type, r.Doc.WordCount, r.Doc.Path)
 	}
 }
 
@@ -209,16 +219,13 @@ func printStats(idx *indexer.Index, store *storage.Store) {
 	if !stats.LastIndexed.IsZero() {
 		fmt.Printf("  Indexado em: %s\n", stats.LastIndexed.Format("02/01/2006 15:04:05"))
 	}
-	if len(stats.Directories) > 0 {
-		fmt.Printf("  Diretórios:\n")
-		for _, d := range stats.Directories {
-			fmt.Printf("    %s\n", d)
-		}
+	for _, d := range stats.Directories {
+		fmt.Printf("  Dir: %s\n", d)
 	}
 	if store.Exists() {
 		t, size, err := store.Info()
 		if err == nil {
-			fmt.Printf("  Índice em disco: %s (%s)\n", t.Format("02/01 15:04"), formatSize(size))
+			fmt.Printf("  Arquivo:     %s (%s)\n", t.Format("02/01 15:04"), formatSize(size))
 		}
 	}
 }
@@ -231,21 +238,15 @@ func exportResults(query string, results []*indexer.SearchResult) {
 		Type  string  `json:"type"`
 		Words int     `json:"words"`
 		Size  int64   `json:"size"`
-		Match string  `json:"match_type"`
 	}
 	var items []item
 	for i, r := range results {
-		items = append(items, item{
-			Rank: i + 1, Score: r.Score, Path: r.Doc.Path,
-			Type: string(r.Doc.Type), Words: r.Doc.WordCount,
-			Size: r.Doc.Size, Match: string(r.MatchType),
-		})
+		items = append(items, item{i + 1, r.Score, r.Doc.Path,
+			string(r.Doc.Type), r.Doc.WordCount, r.Doc.Size})
 	}
 	out := map[string]interface{}{
-		"query":       query,
-		"total":       len(items),
-		"exported_at": time.Now(),
-		"results":     items,
+		"query": query, "total": len(items),
+		"exported_at": time.Now(), "results": items,
 	}
 	data, _ := json.MarshalIndent(out, "", "  ")
 	fname := fmt.Sprintf("gofind_%d.json", time.Now().Unix())
@@ -263,10 +264,14 @@ func defaultDataDir() string {
 
 func formatSize(n int64) string {
 	switch {
-	case n >= 1<<30: return fmt.Sprintf("%.1fGB", float64(n)/(1<<30))
-	case n >= 1<<20: return fmt.Sprintf("%.1fMB", float64(n)/(1<<20))
-	case n >= 1<<10: return fmt.Sprintf("%.1fKB", float64(n)/(1<<10))
-	default: return fmt.Sprintf("%dB", n)
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1fGB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1fMB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1fKB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", n)
 	}
 }
 
@@ -279,31 +284,23 @@ func usage() {
 	fmt.Print(`GoFind v` + Version + ` — Motor de busca local
 
 USO:
-  gofind <diretório>              Indexa um diretório e abre a TUI
+  gofind <diretório>              Indexa e abre TUI
   gofind -search "query"          Busca pela linha de comando
-  gofind -search "query" -fuzzy   Busca fuzzy (Levenshtein)
-  gofind -stats                   Mostra estatísticas do índice
+  gofind -search "query" -fuzzy   Busca fuzzy
+  gofind -stats                   Estatísticas do índice
   gofind -clear                   Limpa o índice
 
 FLAGS:
   -index  <dir>    Indexa um diretório
-  -search <query>  Busca sem abrir a TUI
-  -fuzzy           Ativa busca aproximada
+  -search <query>  Busca sem TUI
+  -fuzzy           Busca aproximada (Levenshtein)
   -watch           Re-indexa ao detectar mudanças
   -json            Exporta resultados em JSON
-  -n <num>         Máximo de resultados (padrão: 20)
-  -data   <dir>    Diretório do índice (padrão: ~/.gofind)
+  -n <num>         Máx de resultados (padrão: 20)
+  -data   <dir>    Dir do índice (padrão: ~/.gofind)
   -clear           Limpa o índice
   -stats           Estatísticas
   -version         Versão
-
-TUI:
-  Tab              Alterna exact/fuzzy
-  Ctrl+W           Ativa watch mode
-  Ctrl+E           Exporta em JSON
-  ↓                Move para lista de resultados
-  Enter            Abre arquivo
-  Esc              Sai
 
 `)
 }
